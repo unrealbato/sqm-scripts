@@ -1,0 +1,201 @@
+#!/bin/sh
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License version 2 as published by the
+# Free Software Foundation.
+#
+# Copyright (C) 2012-5 Michael D. Taht, Toke Høiland-Jørgensen, Sebastian
+# Moeller Additional hackery & standing on shoulders of giants (C) 2019 Kevin
+# Darbyshire-Bryant
+# 
+# This script takes advantage of CAKE's diffserv4 mode offering 4 tins of
+# classification Bulk, Best Effort, Video, Voice.  Bulk can be viewed as a sort
+# of 'least effort' and there are many things that can be regarded as 'I don't
+# care how long it takes, it's not interactive, just get it done eventually' vs
+# 'interactive here and now web browsing' vs 'obviously interactive video/voice
+# calls and ssh'.
+#
+# By default CAKE uses DSCP values as a key into the priority tins.
+# Applications that set a DSCP (eg dropbear ssh) should have that
+# respected/used.  CAKE offers other tin keying methods eg. fwmark.  This (by
+# design) ignores any DSCP values, so if you wanted DSCP to have influence you
+# would have to write many x_tables rules to translate DSCP to tin (ie
+# emulating the lookup cake already has)  For this reason I use DSCP as the tin
+# priority key mechanism.
+#
+# DSCP values on egress are easy to find & manipulate.  Ingress is harder
+# because CAKE has already handled the packet before x_tables gets a chance to
+# see it.  An initial idea & solution for this 'ingress classification' problem
+# is to use a tc action called 'connmark'.  This restores the firewall
+# connection mark into the packet and CAKE can be told to look at this restored
+# mark for tin selection.  Events turned out that the initial plans I had for
+# 'fwmark' got neutered and whilst fwmark exists and works, I've chosen not to
+# use it for this solution.
+#
+# What I really wanted to do was store the DSCP value for a connection into the
+# firewall and use that stored DSCP as the key.  Storing on egress and
+# restoring on ingress was potentially more useful to other qdiscs not just
+# CAKE as well.
+#
+# act_ctinfo was written and is in kernel 5.3,  This restores a firewall stored
+# DSCP value into a packet's DSCP field.  The companion 'store' function has
+# not yet made it upstream, being somewhat stalled by my bad C and requirement
+# for an nftables implementation and I quite frankly have no idea how to write
+# for nftables.  A 'hacked' together implementation for iptables does exist and
+# that's what is used here.
+#
+# This script implements a 'dual level' of classification setting.  The 'hard'
+# or fixed layer applies fixed DSCP settings to known host/port combinations.
+# Traffic that isn't in this known set of rules, has a default Best Effort
+# classification and exceeds CONNB bytes transferred is then hooked by a second
+# rules set where it is demoted to BULK.
+
+# How it works
+#
+# We usurp top byte of the firewall connmark for our own purposes.  bits 3-8 =
+# DSCP bit  2   = DSCP is stored in bits 3-8 flag 'DSCPS' bit  1   = DSCP is
+# long-term fixed 'DSCPF'
+#
+# egress packets are hooked by an iptables rule if DSCPS & DSCPF unset and are
+# passed to a 'hard' hosts/port ruleset chain.  This chain sets any applicable
+# DSCP in the packet and then uses connmark savedscp to store that set DSCP
+# value along with a set DSCPS bit in the firewall connmark.  another rule
+# hooks packets that have DSCPS set, DSCPF unset and a conntrack connbytes
+# value bigger than CONNB.  These are sent to the dynamic ruleset chain.  The
+# dynamic ruleset chain changes connections that are currently Best Effort to
+# BULK and sets DSCPF
+
+# ctinfo instances are set on both ingress and egress paths.  The ingress patch
+# is hopefully obvious but ctinfo on egress may not be quite so obvious to
+# understand.  It is there to copy the previously set DSCP value to all
+# corresponding egress packets and thus eliminate the requirement for each
+# packet to pass through the 'hard' ruleset.
+
+. ${SQM_LIB_DIR}/defaults.sh
+QDISC=cake
+CONNB="25000000"
+INGRESS_CAKE_OPTS="diffserv4"
+EGRESS_CAKE_OPTS="diffserv4"
+
+# Default traffic classication is passed in INGRESS_CAKE_OPTS and EGRESS_CAKE_OPTS, defined in defaults.sh now
+
+egress() {
+    SILENT=1 $TC qdisc del dev $IFACE root
+    $TC qdisc add dev $IFACE root cake bandwidth ${UPLINK}kbit \
+	    $( get_cake_lla_string ) ${EGRESS_CAKE_OPTS} ${EQDISC_OPTS}
+
+    # Put an action on the egress interface to set DSCP from the stored connmark.
+    # This seems counter intuitive but it ensures once the mark is set that all
+    # subsequent egress packets have the same stored DSCP avoiding the need to have
+    # iptables rules mark every packet.
+
+    $TC filter add dev $IFACE protocol all prio 10 u32 match u32 0 0 flowid 1:1 action \
+	ctinfo dscp 0xfc000000 0x02000000
+}
+
+
+ingress() {
+
+    SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
+    $TC qdisc add dev $IFACE handle ffff: ingress
+
+    SILENT=1 $TC qdisc del dev $DEV root
+
+    [ "$ZERO_DSCP_INGRESS" -eq "1" ] && INGRESS_CAKE_OPTS="$INGRESS_CAKE_OPTS wash"
+
+    $TC qdisc add dev $DEV root cake bandwidth ${DOWNLINK}kbit \
+	    $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS}
+
+    $IP link set dev $DEV up
+
+    # redirect all IP packets arriving in $IFACE to ifb0
+    # set DSCP from conntrack mark
+    $TC filter add dev $IFACE parent ffff: protocol all prio 10 u32 \
+	match u32 0 0 flowid 1:1 action \
+	ctinfo dscp 0xfc000000 0x02000000 \
+	mirred egress redirect dev $DEV
+}
+
+ipt_setup() {
+    # Configure iptables chains to mark packets
+#    ipt_destruct
+    ipt -t mangle -N QOS_CAKE_${IFACE}
+    ipt -t mangle -N QOS_MARK_F_${IFACE}
+    ipt -t mangle -N QOS_MARK_D_${IFACE}
+
+# 'non-dynamic, fixed' rules
+# 
+# Change DSCP of relevant hosts/ports and save the DSCP to the connmark using savedscp 
+#
+# eg.  I have a skybox which only does downloads & never streams, make it bulk
+# I have a bluray player that speaks netflix/amazon, so it streams and never downloads, make it video
+# I have a bittorrent host, so make that host/port combination bulk.
+# I have some dynamically updated ipsets filled by dnsmasq for Bulk, bideo & voice, so classifiy if they match
+
+#ipv4
+iptables -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s 192.168.219.5 -m comment --comment "Skybox DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+iptables -t mangle -A QOS_MARK_F_${IFACE} -p udp -s 192.168.219.5 -m comment --comment "Skybox DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+iptables -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s 192.168.219.10 -m comment --comment "Bluray DSCP CS3 Video" -j DSCP --set-dscp-class CS3
+iptables -t mangle -A QOS_MARK_F_${IFACE} -p udp -s 192.168.219.10 -m comment --comment "Bluray DSCP CS3 Video" -j DSCP --set-dscp-class CS3
+
+iptables -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s 192.168.219.12 -m tcp --sport 6981 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+iptables -t mangle -A QOS_MARK_F_${IFACE} -p udp -s 192.168.219.12 -m udp --sport 6981 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+iptables -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s 192.168.219.12 -m tcp --sport 4433 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+
+iptables -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Bulk4  dst -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+iptables -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Vid4   dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+iptables -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Voice4 dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+
+#ipv6
+ip6tables -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s ::c/::ffff:ffff:ffff:ffff -m tcp --sport 6981 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+ip6tables -t mangle -A QOS_MARK_F_${IFACE} -p udp -s ::c/::ffff:ffff:ffff:ffff -m udp --sport 6981 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+ip6tables -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s ::c/::ffff:ffff:ffff:ffff -m tcp --sport 4433 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+
+ip6tables -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Bulk6  dst -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+ip6tables -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Vid6 dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+ip6tables -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Voice6 dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+
+# If you wanted a connection to remain as Best Effort, you force the DSCP Fixed bit, something like:
+#ipt -t mangle -A QOS_MARK_F_${IFACE} -m dscp --dscp 0x00 -j CONNMARK --mark 0x01000000/0x01000000
+
+# store the decided DSCP into connmark for later restoration by ctinfo
+ipt -A QOS_MARK_F_${IFACE} -t mangle -j CONNMARK --savedscp-mark 0xfc000000/0x02000000
+# ---- End of 'hard/fixed' rules
+
+
+# Dynamic rules - These get run when a connection first goes above our bulk transfer size limit
+# if stored DSCP is CS0 (Best effort) then set it to CS1 (bulk) - this is the dynamic de-prioritisation.
+ipt -t mangle -A QOS_MARK_D_${IFACE} -m connmark --mark 0x00000000/0xfc000000 -j CONNMARK --set-xmark 0x20000000/0x20000000
+# by now whatever we have we stick, so set DSCPFixed bit
+ipt -t mangle -A QOS_MARK_D_${IFACE} -j CONNMARK --set-xmark 0x01000000/0x01000000
+# ---- End of Dynamic Rules
+
+# CAKE chain to combine the above hard/dynamic rules
+# Send marked connections over CONNB bytes and not DSCPFixed to the dynamic rules
+ipt -t mangle -A QOS_CAKE_${IFACE} -m connmark --mark 0x02000000/0x03000000 -m connbytes \
+	    --connbytes ${CONNB} --connbytes-dir both --connbytes-mode bytes -g QOS_MARK_D_${IFACE}
+# Send unmarked connections to the hard/fixed marking chain
+ipt -t mangle -A QOS_CAKE_${IFACE} -m connmark --mark 0x00000000/0x03000000 -g QOS_MARK_F_${IFACE}
+# ---- Enf of hooking
+
+# Hook the above rules into the firewall path
+ipt -t mangle -A POSTROUTING -o ${IFACE} -j QOS_CAKE_${IFACE}
+
+}
+
+ipt_destruct() {
+	ipt -t mangle -D POSTROUTING -o ${IFACE} -j QOS_CAKE_${IFACE}
+	ipt -t mangle -F QOS_MARK_F_${IFACE}
+	ipt -t mangle -F QOS_MARK_D_${IFACE}
+	ipt -t mangle -F QOS_CAKE_${IFACE}
+
+	ipt -t mangle -X QOS_MARK_F_${IFACE}
+	ipt -t mangle -X QOS_MARK_D_${IFACE}
+	ipt -t mangle -X QOS_CAKE_${IFACE}
+}
+
+sqm_prepare_script() {
+	do_modules
+	verify_qdisc $QDISC "cake" || return 1
+	ipt_setup
+}
