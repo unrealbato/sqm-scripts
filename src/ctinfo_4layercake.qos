@@ -91,8 +91,8 @@ DURDN=30
 # below is simplified Rate * 1000 * duration / 8 ie 1000/8 = 125
 CONNBDN=$(( ${DOWNLINK} * 125 * ${DURDN} ))
 CONNBUP=$(( ${UPLINK}   * 125 * ${DURUP} ))
-INGRESS_CAKE_OPTS="diffserv4"
-EGRESS_CAKE_OPTS="diffserv4"
+INGRESS_CAKE_OPTS="diffserv5"
+EGRESS_CAKE_OPTS="diffserv5"
 
 network_get_subnet SUBNET lan
 network_get_prefix6 PREFIX wan6
